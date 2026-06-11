@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp-chatbot",
+  "private": true,
+  "type": "module",
+  "description": "DermaplastCRM WhatsApp agent (Twilio + Gemini)",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.108.1",
+    "chrono-node": "^2.9.1",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
+    "morgan": "^1.10.0",
+    "twilio": "^5.13.1"
+  },
+  "version": "1.0.0",
+  "main": "agent.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
