@@ -12,11 +12,14 @@ export default async function handler(req, res) {
 			req
 		});
 
+		// Vercel is serverless: await queued async work so Twilio messages
+		// are actually sent before the function terminates.
+		if (result?.queued && typeof result.runAsyncWork === "function") {
+			await result.runAsyncWork();
+		}
+
 		// Twilio expects TwiML immediately. The handler queues async work internally.
 		res.status(result.status).type(result.contentType).send(result.body);
-		if (result.queued && result.runAsyncWork) {
-			void result.runAsyncWork();
-		}
 	} catch (err) {
 		// Last-resort fallback to keep webhook response valid TwiML.
 		// (The Express server does similar handling.)

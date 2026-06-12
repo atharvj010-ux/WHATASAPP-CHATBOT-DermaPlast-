@@ -12,10 +12,12 @@ export default async function handler(req, res) {
 			req
 		});
 
-		res.status(result.status).type(result.contentType).send(result.body);
-		if (result.queued && result.runAsyncWork) {
-			void result.runAsyncWork();
+		// Ensure async processing completes in Vercel serverless.
+		if (result?.queued && typeof result.runAsyncWork === "function") {
+			await result.runAsyncWork();
 		}
+
+		res.status(result.status).type(result.contentType).send(result.body);
 	} catch (_err) {
 		res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
 	}
