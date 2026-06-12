@@ -451,6 +451,29 @@ export async function handleAppointmentBookingFromWhatsApp({ from, body, outboun
 		}
 		const patient = await findPatientByName(name);
 		if (!patient) {
+			// If the user is actually trying to book (but Gemini misclassified as reschedule),
+			// fall back to the booking flow so new customers are not blocked.
+			if (looksLikeAppointmentRequest(text) || isExplicitCrmAppointmentCommand(text)) {
+				const mobileCandidate = extractMobileFromText(text);
+				const nextSession = mergeDraft(session, {
+					patientName: name,
+					mobile: mobileCandidate ?? draft.mobile ?? null,
+					intent: "book_appointment",
+					awaitingField: null,
+					customerLookupState: null
+				});
+				const enriched = await enrichSessionWithPatient(nextSession);
+				setSession(from, enriched);
+
+				const missing = nextMissingField(enriched.appointmentDraft);
+				if (missing) {
+					await promptForField(from, missing, enriched, outboundFrom);
+					return { handled: true };
+				}
+
+				return finishBooking(from, enriched, outboundFrom);
+			}
+
 			logCrm("appointment_patient_not_found", { patientName: name });
 			await sendWhatsAppMessage({ to: from, body: CRM_ERRORS.PATIENT_NOT_FOUND, from: outboundFrom });
 			return { handled: true };
