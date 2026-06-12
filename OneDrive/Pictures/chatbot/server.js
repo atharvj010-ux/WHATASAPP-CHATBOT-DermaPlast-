@@ -179,6 +179,10 @@ async function handleWhatsAppWebhook(req, res) {
 
 app.post("/whatsapp", handleWhatsAppWebhook);
 app.post("/twilio/whatsapp", handleWhatsAppWebhook);
+// Vercel often prefixes serverless-style routes with `/api/*`.
+// Add aliases so Twilio can target either `/whatsapp` or `/api/twilio/whatsapp`.
+app.post("/api/whatsapp", handleWhatsAppWebhook);
+app.post("/api/twilio/whatsapp", handleWhatsAppWebhook);
 app.post("/webhook", handleWhatsAppWebhook);
 
 app.use((req, res) => {
