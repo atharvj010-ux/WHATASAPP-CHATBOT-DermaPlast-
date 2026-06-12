@@ -104,6 +104,17 @@ export function getWhatsAppFromNumber() {
 	return `whatsapp:+${n.replace(/^\+/, "")}`;
 }
 
+function normalizeWhatsAppFromNumber(raw) {
+	const v = String(raw || "").trim();
+	if (!v) return null;
+	// Twilio is strict about the `whatsapp:+<number>` format; remove whitespace even
+	// if the value already starts with `whatsapp:`.
+	if (v.startsWith("whatsapp:")) return v.replace(/\s+/g, "");
+	const n = v.replace(/\s+/g, "");
+	if (n.startsWith("+")) return `whatsapp:${n}`;
+	return `whatsapp:+${n.replace(/^\+/, "")}`;
+}
+
 function logTwilioSendFailure(err, context) {
 	const code = err?.code ?? err?.status ?? null;
 	const more = err?.moreInfo ?? null;
@@ -131,9 +142,14 @@ function logTwilioSendFailure(err, context) {
 	}
 }
 
-export async function sendWhatsAppMessage({ to, body }) {
+/**
+ * Send a WhatsApp message via Twilio REST API.
+ * Allows overriding the outbound "from" number (useful for Twilio Sandbox where
+ * the From must match the inbound webhook's To).
+ */
+export async function sendWhatsAppMessage({ to, body, from: fromOverride }) {
 	const client = getTwilioClient();
-	const from = getWhatsAppFromNumber();
+	const from = normalizeWhatsAppFromNumber(fromOverride) || getWhatsAppFromNumber();
 	if (!from) {
 		throw new Error("Missing TWILIO_WHATSAPP_FROM or TWILIO_WHATSAPP_NUMBER");
 	}

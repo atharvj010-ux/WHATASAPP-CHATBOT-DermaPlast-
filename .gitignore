@@ -1,0 +1,11 @@
+node_modules/
+/*
+!.gitignore
+!OneDrive/
+OneDrive/*
+!OneDrive/Pictures/
+OneDrive/Pictures/*
+!OneDrive/Pictures/chatbot/
+!OneDrive/Pictures/chatbot/**
+OneDrive/Pictures/chatbot/node_modules/
+OneDrive/Pictures/chatbot/.env*

@@ -222,6 +222,127 @@ export async function findPatientForCrm(name) {
 	return patient;
 }
 
+async function selectPatientRow(queryBuilder) {
+	const { data, error } = await queryBuilder.limit(1);
+	if (error) {
+		logCrm("patient_lookup_error", { message: error.message, code: error.code, details: error.details });
+		return null;
+	}
+	return (data || [])[0] ?? null;
+}
+
+export async function findPatientByContact({ phone, email }) {
+	const normalizedPhone = String(phone || "").trim();
+	const normalizedEmail = String(email || "").trim().toLowerCase();
+	const ownerId = String(process.env.SUPABASE_DEFAULT_OWNER_ID || "").trim() || null;
+	if (!normalizedPhone && !normalizedEmail) return null;
+
+	let patient = null;
+	if (normalizedPhone) {
+		logCrm("patient_lookup_by_phone", { phone: normalizedPhone, ownerScope: ownerId || "any" });
+		let query = supabase
+			.from("patients")
+			.select("id,name,owner_id,phone,email,gender")
+			.ilike("phone", `%${normalizedPhone}%`)
+			.order("updated_at", { ascending: false });
+		if (ownerId) query = query.eq("owner_id", ownerId);
+		patient = await selectPatientRow(query);
+		if (patient) {
+			logCrm("patient_lookup_found", {
+				patientId: patient.id,
+				name: patient.name,
+				ownerId: patient.owner_id,
+				method: "phone"
+			});
+			return patient;
+		}
+	}
+
+	if (normalizedEmail) {
+		logCrm("patient_lookup_by_email", { email: normalizedEmail, ownerScope: ownerId || "any" });
+		let query = supabase
+			.from("patients")
+			.select("id,name,owner_id,phone,email,gender")
+			.eq("email", normalizedEmail)
+			.order("updated_at", { ascending: false });
+		if (ownerId) query = query.eq("owner_id", ownerId);
+		patient = await selectPatientRow(query);
+		if (patient) {
+			logCrm("patient_lookup_found", {
+				patientId: patient.id,
+				name: patient.name,
+				ownerId: patient.owner_id,
+				method: "email"
+			});
+			return patient;
+		}
+	}
+
+	logCrm("patient_lookup_not_found", {
+		phone: normalizedPhone || null,
+		email: normalizedEmail || null,
+		ownerScope: ownerId || "any"
+	});
+	return null;
+}
+
+export async function createPatientRecord({
+	name,
+	phone,
+	email,
+	gender,
+	treatmentCategory,
+	ownerId: ownerOverride
+}) {
+	const ownerId = ownerOverride || String(process.env.SUPABASE_DEFAULT_OWNER_ID || "").trim();
+	if (!ownerId) {
+		const err = new Error("Missing owner_id for patient creation");
+		logCrm("patient_insert_owner_missing", { name, phone });
+		return { ok: false, error: err, record: null, duplicate: false };
+	}
+
+	const payload = {
+		owner_id: ownerId,
+		name,
+		phone,
+		status: "new"
+	};
+	if (email) payload.email = email;
+	if (gender) payload.gender = gender;
+	if (treatmentCategory) payload.treatment_category = treatmentCategory;
+
+	logCrm("patient_insert_attempt", { ownerId, name, phone });
+	const { data, error } = await supabase
+		.from("patients")
+		.insert(payload)
+		.select("id,owner_id,name,phone,email,gender")
+		.single();
+
+	const duplicated = Boolean(error && error.code === "23505");
+	if (error) {
+		logCrm("patient_insert_error", {
+			message: error.message,
+			code: error.code,
+			details: error.details,
+			ownerId
+		});
+		return { ok: false, error, record: null, duplicate: duplicated };
+	}
+
+	if (!data?.id) {
+		const err = new Error("Insert returned no patient row");
+		logCrm("patient_insert_no_row", { payload });
+		return { ok: false, error: err, record: null, duplicate: false };
+	}
+
+	logCrm("patient_insert_verified", {
+		patientId: data.id,
+		ownerId: data.owner_id,
+		name: data.name
+	});
+	return { ok: true, error: null, record: data, duplicate: false };
+}
+
 export function logCrmDebugSummary(summary) {
 	console.log(
 		JSON.stringify({

@@ -12,6 +12,31 @@ import {
 	insertChatMessage
 } from "./services/sessionPersist.js";
 import { detectLanguageFromMessage } from "./crm/language.js";
+import {
+	startBookingSession,
+	getBookingSession,
+	updateBookingStep,
+	clearBookingSession,
+	isBookingInProgress
+} from "./services/sessionService.js";
+import { findPatientByPhone } from "./services/supabaseService.js";
+import {
+	AVAILABLE_SLOTS,
+	normalizeDateInput,
+	normalizeTimeInput,
+	getAvailableSlotsForDate,
+	bookAppointment,
+	formatDateForMessage
+} from "./services/appointmentService.js";
+import { answerFaq } from "./services/faqService.js";
+import { trackLangfuseEvent } from "./services/langfuseService.js";
+import {
+	GENERAL_WELCOME,
+	BOOKING_WELCOME,
+	promptForStep,
+	formatSlotsList,
+	formatBookingConfirmation
+} from "./services/responseService.js";
 
 export const EMPTY_TWIML =
 	'<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
@@ -30,6 +55,267 @@ function logWebhook(event, data) {
 	);
 }
 
+const BOOKING_TRIGGER_REGEX =
+	// Booking commands that should start/continue appointment booking.
+	// Keep this narrow so FAQ questions like "Do you offer skin consultation?"
+	// don't get misrouted into booking flow just because the word "consultation"
+	// appears.
+	/\b(book appointment|book consultation|appointment|i want to book|need consultation|schedule visit)\b/i;
+const CANCEL_REGEX = /^(cancel|stop|exit|quit)\b/i;
+const GREETING_REGEX = /^(hi|hii|hello|hey|start|good morning|good evening)\b/i;
+const QUESTION_REGEX =
+	// Anything that looks like a clinic/FAQ question.
+	// Important: Keep this broad so FAQ routing works even during booking flows.
+	/\b(where|location|address|timings?|hours|open|close|what|why|how|is|are|can|cost|price|fee|treatment|services|prp|gfc|hair|skin|acne|laser|consultation|offer)\b/i;
+
+async function handleFaqDuringBooking({ from, question, outboundFrom }) {
+	const faqResponse = await answerFaq(question);
+	if (faqResponse?.answer) {
+		const session = getBookingSession(from);
+		let reply = faqResponse.answer;
+		if (session) {
+			reply += `\n\nNow continuing your appointment booking.\n${promptForStep(
+				session.step
+			)}`;
+		}
+		await replyMessage(from, reply, outboundFrom);
+		return true;
+	}
+	return false;
+}
+
+	async function replyMessage(to, message, outboundFrom) {
+		console.log("Bot reply:", message);
+		await trackLangfuseEvent("whatsapp.reply", { to, message });
+		await sendWhatsAppMessage({ to, body: message, from: outboundFrom });
+	}
+
+async function handleGuidedBooking({ from, text, outboundFrom }) {
+	const trimmed = String(text || "").trim();
+	if (!trimmed) return false;
+	const lower = trimmed.toLowerCase();
+	const session = getBookingSession(from);
+	console.log(
+		JSON.stringify({
+			ts: new Date().toISOString(),
+			channel: "booking-flow",
+			event: "incoming",
+			user: from,
+			step: session?.step ?? "none",
+			text: trimmed
+		})
+	);
+
+	await trackLangfuseEvent("whatsapp.booking_message", {
+		user: from,
+		step: session?.step ?? "none",
+		text: trimmed
+	});
+
+	if (session && CANCEL_REGEX.test(lower)) {
+		await replyMessage(from, "Appointment booking cancelled. How else can I help you?", outboundFrom);
+		clearBookingSession(from);
+		return true;
+	}
+
+	if (!session && BOOKING_TRIGGER_REGEX.test(trimmed)) {
+		startBookingSession(from);
+
+		// Attempt to pre-load customer details using WhatsApp sender number.
+		// This lets existing customers skip name/phone steps.
+		let existingCustomer = null;
+		try {
+			const rawDigits = String(from || "").replace(/\D+/g, "");
+			let normalizedDigits = rawDigits;
+			// If sender includes +91, normalize to last 10 digits.
+			if (normalizedDigits.startsWith("91") && normalizedDigits.length > 10) {
+				normalizedDigits = normalizedDigits.slice(2);
+			}
+			if (normalizedDigits.length > 10) normalizedDigits = normalizedDigits.slice(-10);
+			if (normalizedDigits.length >= 6) {
+				existingCustomer = await findPatientByPhone(normalizedDigits);
+			}
+		} catch (err) {
+			console.warn("[booking] existing customer lookup failed", err?.message || err);
+		}
+
+		await trackLangfuseEvent("whatsapp.booking_started", { user: from, hasExisting: Boolean(existingCustomer) });
+
+		if (existingCustomer?.id) {
+			updateBookingStep(from, "treatment", {
+				name: existingCustomer.name,
+				phone: existingCustomer.phone
+			});
+			await replyMessage(
+				from,
+				`Welcome back ${existingCustomer.name}. I found your details.\n${promptForStep("treatment")}`,
+				outboundFrom
+			);
+		} else {
+			await replyMessage(from, BOOKING_WELCOME, outboundFrom);
+		}
+		return true;
+	}
+
+	if (!session) return false;
+
+	switch (session.step) {
+		case "name": {
+			if (!trimmed) {
+				await replyMessage(from, promptForStep("name"), outboundFrom);
+				return true;
+			}
+			updateBookingStep(from, "phone", { name: trimmed });
+			await trackLangfuseEvent("whatsapp.booking_collected", {
+				user: from,
+				step: "name",
+				value: trimmed
+			});
+			await replyMessage(from, promptForStep("phone"));
+			return true;
+		}
+		case "phone": {
+			let digits = trimmed.replace(/\D+/g, "");
+			// Normalize Indian numbers: allow +91 or 91 prefix, store last 10 digits.
+			if (digits.startsWith("91") && digits.length > 10) {
+				digits = digits.slice(-10);
+			}
+			if (!digits || digits.length !== 10) {
+				await replyMessage(from, "Please share a valid phone number (digits only).", outboundFrom);
+				return true;
+			}
+			updateBookingStep(from, "treatment", { phone: digits });
+			await trackLangfuseEvent("whatsapp.booking_collected", {
+				user: from,
+				step: "phone",
+				value: digits
+			});
+			await replyMessage(from, promptForStep("treatment"));
+			return true;
+		}
+		case "treatment": {
+			if (!trimmed) {
+				await replyMessage(from, promptForStep("treatment"), outboundFrom);
+				return true;
+			}
+			updateBookingStep(from, "date", { treatment: trimmed });
+			await trackLangfuseEvent("whatsapp.booking_collected", {
+				user: from,
+				step: "treatment",
+				value: trimmed
+			});
+			await replyMessage(from, promptForStep("date"));
+			return true;
+		}
+		case "date": {
+			const normalizedDate = normalizeDateInput(trimmed);
+			if (!normalizedDate) {
+				await replyMessage(
+					from,
+					"I couldn't understand that date. Please share a date like 2026-06-15.",
+					outboundFrom
+				);
+				return true;
+			}
+			// Prevent booking for past dates.
+			const todayIso = new Date().toISOString().split("T")[0];
+			if (normalizedDate < todayIso) {
+				await replyMessage(
+					from,
+					"Appointment date cannot be in the past. Please share a new preferred date (e.g. 2026-06-15).",
+					outboundFrom
+				);
+				return true;
+			}
+			updateBookingStep(from, "time", { appointmentDate: normalizedDate });
+			await trackLangfuseEvent("whatsapp.booking_collected", {
+				user: from,
+				step: "date",
+				value: normalizedDate
+			});
+			await replyMessage(from, promptForStep("time"));
+			return true;
+		}
+		case "time": {
+			const normalizedTime = normalizeTimeInput(trimmed);
+			if (!normalizedTime) {
+				await replyMessage(
+					from,
+					`Please choose a slot from the available times:\n${formatSlotsList(AVAILABLE_SLOTS)}`,
+					outboundFrom
+				);
+				return true;
+			}
+			try {
+				const bookingResult = await bookAppointment({
+					name: session.data.name,
+					phone: session.data.phone,
+					treatmentType: session.data.treatment,
+					appointmentDate: session.data.appointmentDate,
+					appointmentTime: normalizedTime
+				});
+
+				await trackLangfuseEvent("whatsapp.booking_attempt", {
+					user: from,
+					date: session.data.appointmentDate,
+					time: normalizedTime,
+					result: bookingResult.ok ? "success" : "conflict"
+				});
+
+				if (!bookingResult.ok) {
+					const dateText = formatDateForMessage(session.data.appointmentDate);
+					const available =
+						bookingResult.availableSlots?.length > 0
+							? bookingResult.availableSlots
+							: await getAvailableSlotsForDate(session.data.appointmentDate);
+					const slotList = available.length
+						? formatSlotsList(available)
+						: "No slots are currently available for this date.";
+					await replyMessage(
+						from,
+						`Sorry, this slot is already booked.\nAvailable slots for ${dateText} are:\n${slotList}\n\nPlease choose one of these slots.`
+						,
+						outboundFrom
+					);
+					return true;
+				}
+
+				const dateText = formatDateForMessage(session.data.appointmentDate);
+				await replyMessage(
+					from,
+					formatBookingConfirmation({
+						name: session.data.name,
+						treatment: session.data.treatment,
+						date: dateText,
+						time: normalizedTime
+					}),
+					outboundFrom
+				);
+				await trackLangfuseEvent("whatsapp.booking_confirmed", {
+					user: from,
+					name: session.data.name,
+					treatment: session.data.treatment,
+					date: session.data.appointmentDate,
+					time: normalizedTime
+				});
+				clearBookingSession(from);
+				return true;
+			} catch (err) {
+				console.error("[booking] error", err?.message || err);
+				await replyMessage(
+					from,
+					"Something went wrong while booking your appointment. Please try again.",
+					outboundFrom
+				);
+				clearBookingSession(from);
+				return true;
+			}
+		}
+		default:
+			return false;
+	}
+}
+
 function enqueueForUser(userId, fn) {
 	const prev = userChains.get(userId) || Promise.resolve();
 	const next = prev
@@ -44,11 +330,11 @@ function enqueueForUser(userId, fn) {
 	return next;
 }
 
-async function sendWhatsAppWithRetries({ to, body }) {
+async function sendWhatsAppWithRetries({ to, body, fromOverride }) {
 	let last;
 	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
-			const msg = await sendWhatsAppMessage({ to, body });
+			const msg = await sendWhatsAppMessage({ to, body, from: fromOverride });
 			return { ok: true, sid: msg?.sid, status: msg?.status, attempt };
 		} catch (e) {
 			last = e;
@@ -59,7 +345,7 @@ async function sendWhatsAppWithRetries({ to, body }) {
 	return { ok: false, error: last?.message || String(last), code: last?.code ?? null };
 }
 
-async function deliverAiReply({ from, userText, messageSid }) {
+async function deliverAiReply({ from, userText, messageSid, outboundFrom }) {
 	const t0 = Date.now();
 	let aiStatus = "ok";
 	let reply = "";
@@ -120,6 +406,12 @@ async function deliverAiReply({ from, userText, messageSid }) {
 			responseTimeMs: Date.now() - t0
 		});
 
+		await trackLangfuseEvent("whatsapp.ai_reply", {
+			user: from,
+			reply,
+			chars: reply.length
+		});
+
 		logWebhook("ai_generated", {
 			messageSid,
 			from,
@@ -131,6 +423,11 @@ async function deliverAiReply({ from, userText, messageSid }) {
 		aiStatus = "error";
 		console.error("[agent]", messageSid, e);
 		reply = "Sorry, our assistant is temporarily unavailable. Please try again.";
+		await trackLangfuseEvent("whatsapp.ai_error", {
+			user: from,
+			error: String(e?.message || e),
+			messageSid
+		});
 		await logChatEvent({
 			channel: "whatsapp",
 			userPhone: from,
@@ -152,7 +449,7 @@ async function deliverAiReply({ from, userText, messageSid }) {
 	}
 
 	const sendStarted = Date.now();
-	const sendResult = await sendWhatsAppWithRetries({ to: from, body: reply });
+	const sendResult = await sendWhatsAppWithRetries({ to: from, body: reply, fromOverride: outboundFrom });
 	const totalMs = Date.now() - t0;
 	const sendMs = Date.now() - sendStarted;
 
@@ -171,14 +468,60 @@ async function deliverAiReply({ from, userText, messageSid }) {
 	});
 }
 
-async function processInboundMessage({ messageSid, from, userText }) {
+async function processInboundMessage({ messageSid, from, userText, inboundTo }) {
 	const inboundIntent = classifyInboundIntent(userText);
+	await trackLangfuseEvent("whatsapp.request", {
+		user: from,
+		messageSid,
+		intent: inboundIntent,
+		message: userText
+	});
 	logWebhook("intent_detected", { messageSid, from, inboundIntent });
 	logCrm("inbound_message", { messageSid, from, inboundIntent, preview: userText.slice(0, 160) });
 
+	const trimmedText = String(userText || "").trim();
+	const normalized = trimmedText.toLowerCase();
+	const session = getBookingSession(from);
+
+	console.log("Incoming:", from, trimmedText);
+	console.log("Session:", session);
+
+	const isGreeting = GREETING_REGEX.test(normalized);
+	const isQuestion = QUESTION_REGEX.test(normalized) && !BOOKING_TRIGGER_REGEX.test(normalized);
+	const isBookingIntent = BOOKING_TRIGGER_REGEX.test(normalized);
+	const outboundFrom = inboundTo;
+
+	let intentLabel = "unknown";
+
+	if (isGreeting && !session) {
+		intentLabel = "greeting";
+		console.log("Intent:", intentLabel);
+		await replyMessage(from, GENERAL_WELCOME, outboundFrom);
+		return;
+	}
+
+	if (isQuestion) {
+		intentLabel = session ? "faq_during_booking" : "faq";
+		console.log("Intent:", intentLabel);
+		if (await handleFaqDuringBooking({ from, question: trimmedText, outboundFrom })) {
+			return;
+		}
+	}
+
+	if (isBookingIntent || session) {
+		intentLabel = "book_appointment";
+		console.log("Intent:", intentLabel);
+		if (await handleGuidedBooking({ from, text: trimmedText, outboundFrom })) {
+			return;
+		}
+	}
+
+	console.log("Intent:", intentLabel);
+
 	const apptResult = await handleAppointmentBookingFromWhatsApp({
 		from,
-		body: userText
+		body: userText,
+		outboundFrom
 	});
 	if (apptResult.handled) return;
 
@@ -196,7 +539,7 @@ async function processInboundMessage({ messageSid, from, userText }) {
 	});
 	if (resultsResult.handled) return;
 
-	await deliverAiReply({ from, userText, messageSid });
+	await deliverAiReply({ from, userText, messageSid, outboundFrom });
 }
 
 /**
@@ -280,6 +623,7 @@ export async function handleInboundWhatsApp({
 
 	const messageSid = body?.MessageSid;
 	const from = body?.From;
+	const inboundTo = body?.To;
 	const rawBody = (body?.Body || "").trim();
 
 	logWebhook("incoming", {
@@ -325,7 +669,7 @@ export async function handleInboundWhatsApp({
 
 	const work = () =>
 		enqueueForUser(from, () =>
-			processInboundMessage({ messageSid, from, userText })
+			processInboundMessage({ messageSid, from, userText, inboundTo })
 		);
 
 	return {
