@@ -32,6 +32,10 @@ export async function trackLangfuseEvent(eventName, metadata = {}) {
 	const traceId = randomUUID();
 	const eventId = randomUUID();
 	const nowIso = new Date().toISOString();
+	const userId = metadata?.user ?? metadata?.userId ?? undefined;
+	const sessionId = metadata?.sessionId ?? undefined;
+	// Langfuse UI filtering often depends on environment; default to "production".
+	const environment = metadata?.environment ?? "production";
 
 	// Use the legacy ingestion endpoint (batch) since it works reliably on Langfuse Cloud.
 	// We create a trace per event to ensure they show up in your Langfuse tracing UI.
@@ -44,12 +48,14 @@ export async function trackLangfuseEvent(eventName, metadata = {}) {
 				body: {
 					id: traceId,
 					name: eventName,
-					userId: metadata?.user ?? metadata?.userId ?? undefined,
+					timestamp: nowIso,
+					userId,
 					input: metadata?.message ?? metadata?.text ?? undefined,
 					output: metadata?.reply ?? metadata?.response ?? undefined,
-					sessionId: metadata?.sessionId ?? undefined,
+					sessionId,
 					metadata,
-					environment: "production"
+					environment,
+					public: true
 				}
 			}
 		]

@@ -38,10 +38,19 @@ import {
 import { classifyInboundIntent, isExplicitCrmTaskCommand } from "./crm/intents.js";
 import { getClinicTimezone } from "./clinicTimezone.js";
 import { generateGeminiContent, DEFAULT_GEMINI_MODEL } from "./services/geminiService.js";
+import { trackLangfuseEvent } from "./services/langfuseService.js";
 
 const MAX_HISTORY_MESSAGES = 8;
 const FALLBACK_REPLY =
 	"We’re having a brief technical issue. Please try again in a moment, or call the clinic directly and we’ll help you right away.";
+
+async function safeTrack(eventName, metadata) {
+	try {
+		await trackLangfuseEvent(eventName, metadata ?? {});
+	} catch (e) {
+		// Never break the chatbot because Langfuse fails.
+	}
+}
 
 function mustHaveEnv(name) {
 	if (!process.env[name]) throw new Error(`Missing ${name}`);
@@ -342,10 +351,23 @@ export async function runAgent({ from, userText, session }) {
 }
 
 async function runAgentInner({ from, userText, session }) {
+	let traced = false;
+	const traceEnd = async () => {
+		if (traced) return;
+		traced = true;
+		await safeTrack("trace_end", { user: from, message: String(userText || "") });
+	};
+
 	mustHaveEnv("GEMINI_API_KEY");
 	const model = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
 	const info = clinicContext();
 	const lang = resolveSessionLanguage(session, userText);
+
+	// Step events (used for easier Langfuse browsing/debugging).
+	await safeTrack("user_question", {
+		user: from,
+		message: String(userText || "")
+	});
 
 	const blockedReply = resolveBlockedTopicReply(userText, lang);
 	if (blockedReply) {
@@ -354,10 +376,16 @@ async function runAgentInner({ from, userText, session }) {
 			responseCategory: isPricingMessage(userText) ? "pricing_query_hard" : "treatment_query_hard"
 		});
 		session.history.push({ role: "user", content: userText }, { role: "assistant", content: blockedReply });
+		await traceEnd();
 		return out(blockedReply, session);
 	}
 
 	if (isTreatmentEducationQuery(userText)) {
+		await safeTrack("entity_extraction", {
+			user: from,
+			message: String(userText || ""),
+			context: "treatment_education_query"
+		});
 		const eduReply = await generateTreatmentEducationReply({
 			userText,
 			lang,
@@ -365,12 +393,14 @@ async function runAgentInner({ from, userText, session }) {
 		});
 		logIntentDebug({ from, responseCategory: "treatment_education_query" });
 		session.history.push({ role: "user", content: userText }, { role: "assistant", content: eduReply });
+		await traceEnd();
 		return out(eduReply, session);
 	}
 
 	if (session.flow === "RESERVATION") {
 		session.flow = null;
 		session.reservationDraft = {};
+		await traceEnd();
 		return out(buildAppointmentBookingGuidance(lang), session);
 	}
 
@@ -378,6 +408,13 @@ async function runAgentInner({ from, userText, session }) {
 	const inboundIntent = classifyInboundIntent(userText);
 	const intent = classifyWhatsappIntent(userText);
 	logIntentDebug({ from, inboundIntent, detectedIntent: intent, preferredLanguage: lang });
+
+	await safeTrack("intent_detection", {
+		user: from,
+		message: String(userText || ""),
+		inboundIntent,
+		intent
+	});
 
 	const routed = await routeIntentReply({
 		from,
@@ -391,6 +428,7 @@ async function runAgentInner({ from, userText, session }) {
 	if (routed) {
 		logIntentDebug({ from, responseCategory: intent });
 		session.history.push({ role: "user", content: userText }, { role: "assistant", content: routed.reply });
+		await traceEnd();
 		return routed;
 	}
 
@@ -399,6 +437,8 @@ async function runAgentInner({ from, userText, session }) {
 		if (faqInstant) {
 			logIntentDebug({ from, responseCategory: "faq_fallback" });
 			session.history.push({ role: "user", content: userText }, { role: "assistant", content: faqInstant });
+			await safeTrack("final_response", { user: from, message: String(userText || ""), reply: faqInstant });
+			await traceEnd();
 			return out(faqInstant, session);
 		}
 	}
@@ -424,6 +464,14 @@ async function runAgentInner({ from, userText, session }) {
 			}),
 		{ label: "gemini.planner" }
 	);
+
+	// Planner generation is a key LLM step.
+	await safeTrack("llm_response_validation", {
+		user: from,
+		message: String(userText || ""),
+		// include a hint that we reached the planner stage
+		context: "planner_generation_completed"
+	});
 
 	const pu = decision.usage;
 	if (pu) {
@@ -454,6 +502,12 @@ async function runAgentInner({ from, userText, session }) {
 		};
 	}
 
+	await safeTrack("llm_prompt_response_validation", {
+		user: from,
+		message: String(userText || ""),
+		context: "planner_json_parsed"
+	});
+
 	if (isPricingMessage(userText)) {
 		return out(buildPricingReply(lang), session);
 	}
@@ -469,14 +523,26 @@ async function runAgentInner({ from, userText, session }) {
 	if (plan.intent === "FAQ" || plan.faqQuery) {
 		const answer = await lookupRestaurantFaq({ question: plan.faqQuery || userText });
 		if (answer && !isPricingMessage(userText) && !isGenericTreatmentInquiry(userText)) {
+			await safeTrack("final_response", {
+				user: from,
+				message: String(userText || ""),
+				reply: answer
+			});
 			session.history.push({ role: "user", content: userText }, { role: "assistant", content: answer });
+			await traceEnd();
 			return out(answer, session);
 		}
 	}
 
 	if (plan.startReservation || plan.intent === "RESERVATION") {
 		const reply = buildAppointmentBookingGuidance(lang);
+		await safeTrack("final_response", {
+			user: from,
+			message: String(userText || ""),
+			reply
+		});
 		session.history.push({ role: "user", content: userText }, { role: "assistant", content: reply });
+		await traceEnd();
 		return out(reply, session);
 	}
 
@@ -905,6 +971,12 @@ export async function runCrmAssistant({ from, userText, accessToken, session }) 
 			? formatTaskListReply(toolData.parsed, toolData.rows)
 			: formatTaskEmptyMessage(toolData.parsed);
 		session.history.push({ role: "user", content: userText }, { role: "assistant", content: reply });
+		await safeTrack("final_response", {
+			user: from,
+			message: String(userText || ""),
+			reply
+		});
+		await traceEnd();
 		return out(reply, session);
 	}
 
@@ -969,6 +1041,12 @@ ${toolData == null ? "null" : JSON.stringify(toolData).slice(0, 22000)}
 	const content = String(completion?.text || "").trim();
 	const reply = normalizeWhatsAppFormatting(content || "No records found.");
 	session.history.push({ role: "user", content: userText }, { role: "assistant", content: reply });
+	await safeTrack("final_response", {
+		user: from,
+		message: String(userText || ""),
+		reply
+	});
+	await traceEnd();
 	return out(reply, session);
 }
 

@@ -1,4 +1,5 @@
 import { handleInboundWhatsApp } from "../../../inbound.js";
+import { trackLangfuseEvent } from "../../../services/langfuseService.js";
 
 export default async function handler(req, res) {
 	if (req.method !== "POST") {
@@ -7,6 +8,13 @@ export default async function handler(req, res) {
 	}
 
 	try {
+		// Quick visibility ping: confirm Vercel has Langfuse keys and ingestion works.
+		await trackLangfuseEvent("webhook_langfuse_ping", {
+			user: req.body?.From ?? "unknown",
+			message: String(req.body?.Body || "").slice(0, 500),
+			environment: process.env.NODE_ENV || "production"
+		});
+
 		const result = await handleInboundWhatsApp({
 			body: req.body || {},
 			req
